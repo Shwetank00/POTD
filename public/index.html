@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>LeetCode Auto Submitter</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        display: flex;
+        justify-content: center;
+        padding-top: 50px;
+      }
+      form {
+        display: flex;
+        flex-direction: column;
+        width: 300px;
+        gap: 10px;
+      }
+      input,
+      button {
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <form action="/update-creds" method="POST">
+      <h3>Update LeetCode Cookies</h3>
+      <p>
+        <small
+          >Get these from Chrome DevTools (Application -> Cookies) while logged
+          in.</small
+        >
+      </p>
+      <input
+        type="text"
+        name="session"
+        placeholder="LEETCODE_SESSION"
+        required
+      />
+      <input type="text" name="csrf" placeholder="csrftoken" required />
+      <button type="submit">Save Credentials</button>
+      <a href="/trigger" style="text-align: center; margin-top: 20px"
+        >Test Run Now</a
+      >
+    </form>
+  </body>
+</html>

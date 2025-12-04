@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
@@ -99,16 +101,28 @@ async function solvePOTD() {
 
   console.log(`Solving POTD: ${titleSlug} (ID: ${questionFrontendId})`);
 
+  // Launch Browser (Production / Docker Version)
   const browser = await puppeteer.launch({
-    headless: "new",
+    headless: "new", // Run in background (no window)
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--single-process",
-      "--window-size=1280,800",
+      "--single-process", // Crucial for Docker
     ],
   });
+
+  // // Launch Browser (Windows / Local Friendly Version)
+  // const browser = await puppeteer.launch({
+  //   // Set to 'false' so you can SEE the browser working!
+  //   // Set to 'true' or '"new"' if you want it hidden.
+  //   headless: false,
+  //   args: [
+  //     "--start-maximized", // Opens browser in full width
+  //     // We REMOVED '--single-process' and '--no-sandbox' which cause crashes on Windows
+  //   ],
+  //   defaultViewport: null, // Allows the website to fill the window
+  // });
 
   try {
     const page = await browser.newPage();

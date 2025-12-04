@@ -4,135 +4,178 @@ const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const cron = require("node-cron");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-const fs = require("fs"); // access file system
-const vm = require("vm"); // execute code in memory
+const fs = require("fs");
+const vm = require("vm");
 
+// Enable stealth mode to avoid detection
 puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
-// --- NEW: Load solutions without modifying the file ---
+// ---------------------------------------------------------
+// 1. DYNAMIC SOLUTION LOADER
+// Reads your solutions.js file without modifying it
+// ---------------------------------------------------------
 function loadSolutions() {
   try {
-    // 1. Read the file content as a string
+    if (!fs.existsSync("./solutions.js")) {
+      console.error("solutions.js file not found!");
+      return {};
+    }
     const code = fs.readFileSync("./solutions.js", "utf8");
-
-    // 2. Create a sandbox (an empty context)
     const sandbox = {};
     vm.createContext(sandbox);
-
-    // 3. Run the code in the sandbox.
-    // We append "; LEETCODE_SOLUTIONS;" to the end so the script returns the object.
+    // Execute the file string and return the LEETCODE_SOLUTIONS object
     return vm.runInContext(code + "; LEETCODE_SOLUTIONS;", sandbox);
   } catch (e) {
     console.error("Error loading solutions.js:", e.message);
-    return {}; // Return empty object if failed
+    return {};
   }
 }
 
-const solutions = loadSolutions();
-// -------------------------------------------------------
-
+// Global Credentials (loaded from Environment Variables on Render)
 let USER_COOKIES = {
   LEETCODE_SESSION: process.env.LEETCODE_SESSION || "",
   csrftoken: process.env.CSRF_TOKEN || "",
 };
 
-// 1. Helper to get today's POTD ID
+// ---------------------------------------------------------
+// 2. HELPER: FETCH POTD & CHECK STATUS
+// ---------------------------------------------------------
 async function getDailyProblem() {
   try {
-    const response = await axios.post("https://leetcode.com/graphql", {
-      query: `
-                query questionOfToday {
-                    activeDailyCodingChallengeQuestion {
-                        question {
-                            questionFrontendId
-                            titleSlug
+    const response = await axios.post(
+      "https://leetcode.com/graphql",
+      {
+        query: `
+                    query questionOfToday {
+                        activeDailyCodingChallengeQuestion {
+                            date
+                            userStatus
+                            link
+                            question {
+                                questionFrontendId
+                                titleSlug
+                            }
                         }
                     }
-                }
-            `,
-    });
-    return response.data.data.activeDailyCodingChallengeQuestion.question;
+                `,
+      },
+      {
+        // Cookies are required here to check YOUR specific userStatus
+        headers: {
+          Cookie: `LEETCODE_SESSION=${USER_COOKIES.LEETCODE_SESSION}; csrftoken=${USER_COOKIES.csrftoken}`,
+          Referer: "https://leetcode.com/",
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    return response.data.data.activeDailyCodingChallengeQuestion;
   } catch (error) {
-    console.error("Error fetching POTD:", error.message);
+    console.error("Error fetching POTD details:", error.message);
     return null;
   }
 }
 
-// 2. The Automation Logic
+// ---------------------------------------------------------
+// 3. MAIN LOGIC: SOLVE THE PROBLEM
+// ---------------------------------------------------------
 async function solvePOTD() {
-  console.log("Starting Daily Submission Task...");
+  console.log("--- Starting Daily Submission Task ---");
 
-  // Refresh solutions in case file changed (optional)
+  // Reload solutions in case you updated the file
   const currentSolutions = loadSolutions();
 
+  // Validation
   if (!USER_COOKIES.LEETCODE_SESSION || !USER_COOKIES.csrftoken) {
-    console.log("No credentials found. Skipping.");
-    return;
-  }
-
-  const problem = await getDailyProblem();
-  if (!problem) return;
-
-  const { questionFrontendId, titleSlug } = problem;
-  const solutionCode = currentSolutions[questionFrontendId];
-
-  if (!solutionCode) {
     console.log(
-      `No solution found locally for Problem ID: ${questionFrontendId}`
+      "Error: No credentials found. Please set Environment Variables or use the frontend."
     );
     return;
   }
 
-  console.log(`Solving POTD: ${titleSlug} (ID: ${questionFrontendId})`);
+  // Get Problem Data
+  const dailyData = await getDailyProblem();
+  if (!dailyData) return;
+
+  // CHECK: If already solved, stop here.
+  if (dailyData.userStatus === "Finish") {
+    console.log(
+      `[SKIP] Today's problem (${dailyData.question.titleSlug}) is already marked as 'Finish'.`
+    );
+    return;
+  }
+
+  const { questionFrontendId, titleSlug } = dailyData.question;
+  const solutionCode = currentSolutions[questionFrontendId];
+
+  // CHECK: Do we have the code?
+  if (!solutionCode) {
+    console.log(
+      `[FAIL] No solution found in solutions.js for Problem ID: ${questionFrontendId}`
+    );
+    return;
+  }
+
+  console.log(`Solving: ${titleSlug} (ID: ${questionFrontendId})`);
 
   // Launch Browser
   const browser = await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--single-process", // Optimization for Docker
+    ],
   });
 
-  const page = await browser.newPage();
-
-  // Set authentication cookies
-  await page.setCookie(
-    {
-      name: "LEETCODE_SESSION",
-      value: USER_COOKIES.LEETCODE_SESSION,
-      domain: ".leetcode.com",
-    },
-    {
-      name: "csrftoken",
-      value: USER_COOKIES.csrftoken,
-      domain: ".leetcode.com",
-    }
-  );
-
   try {
+    const page = await browser.newPage();
+
+    // Inject Cookies
+    await page.setCookie(
+      {
+        name: "LEETCODE_SESSION",
+        value: USER_COOKIES.LEETCODE_SESSION,
+        domain: ".leetcode.com",
+      },
+      {
+        name: "csrftoken",
+        value: USER_COOKIES.csrftoken,
+        domain: ".leetcode.com",
+      }
+    );
+
+    // Go to Problem Page
     await page.goto(`https://leetcode.com/problems/${titleSlug}/`, {
       waitUntil: "networkidle2",
+      timeout: 60000,
     });
 
-    // Wait for editor
-    await page.waitForSelector(".monaco-editor");
-    await page.click(".monaco-editor");
+    // Wait for Editor
+    console.log("Waiting for editor...");
+    const editorSelector = ".monaco-editor";
+    await page.waitForSelector(editorSelector, { timeout: 30000 });
+    await page.click(editorSelector);
 
-    // Select all and delete
+    // Clear existing code
     await page.keyboard.down("Control");
     await page.keyboard.press("A");
     await page.keyboard.up("Control");
     await page.keyboard.press("Backspace");
 
-    // Type solution
+    // Type new solution
+    console.log("Typing solution...");
     await page.keyboard.sendCharacter(solutionCode);
 
-    // Small delay
+    // Delay to ensure typing registers
     await new Promise((r) => setTimeout(r, 2000));
 
     // Click Submit
+    console.log("Clicking Submit...");
     const submitBtn = await page.evaluateHandle(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
       return buttons.find((b) => b.innerText.includes("Submit"));
@@ -140,38 +183,60 @@ async function solvePOTD() {
 
     if (submitBtn) {
       await submitBtn.click();
-      console.log("Submitted! Waiting for result...");
-      await page.waitForNavigation({ waitUntil: "networkidle2" });
+      console.log("Submitted! Waiting for network response...");
+      // Wait for the result/submission confirmation
+      await page
+        .waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 })
+        .catch(() => console.log("Navigation timeout, but likely submitted."));
+      console.log("Task Completed Successfully.");
     } else {
-      console.error("Submit button not found.");
+      console.error("Error: Submit button not found on page.");
     }
   } catch (e) {
-    console.error("Automation failed:", e);
+    console.error("Automation Error:", e);
   } finally {
     await browser.close();
   }
 }
 
-// Routes
+// ---------------------------------------------------------
+// 4. ROUTES
+// ---------------------------------------------------------
+
+// PING Route (For UptimeRobot to keep server awake)
+app.get("/ping", (req, res) => {
+  console.log(`[${new Date().toISOString()}] Ping received.`);
+  res.status(200).send("Pong! Server is awake.");
+});
+
+// Manual Trigger (For testing)
+app.get("/trigger", async (req, res) => {
+  // Run asynchronously so the request doesn't time out
+  solvePOTD();
+  res.send("Automation triggered! Check Render logs for progress.");
+});
+
+// Frontend Form Handler (Fallback for manual cookie updates)
 app.post("/update-creds", (req, res) => {
   USER_COOKIES.LEETCODE_SESSION = req.body.session;
   USER_COOKIES.csrftoken = req.body.csrf;
-  console.log("Credentials updated!");
-  res.send("Credentials updated! The bot will run at 6 AM.");
+  console.log("Credentials manually updated via frontend.");
+  res.send("Credentials updated!");
 });
 
-app.get("/trigger", async (req, res) => {
-  await solvePOTD();
-  res.send("Task triggered. Check server logs.");
-});
-
-// Schedule: 6:00 AM UTC
+// ---------------------------------------------------------
+// 5. CRON SCHEDULE
+// Runs at 06:00 AM IST (India Standard Time)
+// ---------------------------------------------------------
 cron.schedule(
   "0 6 * * *",
   () => {
     solvePOTD();
   },
-  { timezone: "Etc/UTC" }
+  {
+    scheduled: true,
+    timezone: "Asia/Kolkata",
+  }
 );
 
 const PORT = process.env.PORT || 3000;

@@ -59,33 +59,22 @@ async function validateSession() {
 // --- 2. UNIVERSAL SOLUTION FETCHER ---
 async function getSolution(id, titleSlug) {
   try {
-    // STRATEGY 1: Check for "ID.txt" (Old format)
     const pathByID = path.join(__dirname, "solutions", `${id}.txt`);
-    if (fs.existsSync(pathByID)) {
-      console.log(`📂 Found local solution (ID): ${id}.txt`);
-      return fs.readFileSync(pathByID, "utf8");
-    }
+    if (fs.existsSync(pathByID)) return fs.readFileSync(pathByID, "utf8");
 
-    // STRATEGY 2: Check for "title-slug.cpp" (GitHub Repo format)
-    // This lets you drop files from kamyu104 directly into your folder!
     const pathByName = path.join(__dirname, "solutions", `${titleSlug}.cpp`);
-    if (fs.existsSync(pathByName)) {
-      console.log(`📂 Found local solution (Name): ${titleSlug}.cpp`);
-      return fs.readFileSync(pathByName, "utf8");
-    }
+    if (fs.existsSync(pathByName)) return fs.readFileSync(pathByName, "utf8");
 
-    // STRATEGY 3: Fetch from GitHub Online (Fallback)
     console.log(
       `🌐 Local file not found. Fetching from GitHub for: ${titleSlug}...`
     );
     const githubUrl = `https://raw.githubusercontent.com/kamyu104/LeetCode-Solutions/master/C++/${titleSlug}.cpp`;
-
     const response = await axios.get(githubUrl);
+
     if (response.status === 200 && response.data) {
-      let code = response.data;
-      // Remove comments to save space
-      code = code.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, "$1").trim();
-      return code;
+      return response.data
+        .replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, "$1")
+        .trim();
     }
   } catch (e) {
     console.error(`❌ Failed to fetch solution for ${titleSlug}:`, e.message);
@@ -139,9 +128,7 @@ async function solvePOTD() {
 
   const session = await validateSession();
   if (!session.valid) {
-    console.log(
-      "❌ ERROR: Credentials are invalid or expired. Please update them."
-    );
+    console.log("❌ ERROR: Credentials are invalid or expired.");
     isProcessing = false;
     return;
   }
@@ -185,6 +172,11 @@ async function solvePOTD() {
 
     const page = await browser.newPage();
 
+    // Use a realistic User Agent
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       if (
@@ -209,21 +201,41 @@ async function solvePOTD() {
       }
     );
 
-    // Navigate with explicit wait for domcontentloaded
     await page.goto(`https://leetcode.com/problems/${titleSlug}/`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    // Log Title for Debugging
-    const pageTitle = await page.title();
-    console.log(`📄 Page Title Loaded: "${pageTitle}"`);
+    // --- NEW CLOUDFLARE HANDLER ---
+    let pageTitle = await page.title();
+    console.log(`📄 Page Title: "${pageTitle}"`);
 
     if (
       pageTitle.includes("Just a moment") ||
       pageTitle.includes("Security Check")
     ) {
-      throw new Error("Blocked by Cloudflare (Page Title: " + pageTitle + ")");
+      console.log(
+        "⚠️ Cloudflare Challenge detected. Waiting for redirect (max 30s)..."
+      );
+
+      try {
+        // Wait for the title to change to something else
+        await page.waitForFunction(
+          () => {
+            const t = document.title;
+            return (
+              !t.includes("Just a moment") && !t.includes("Security Check")
+            );
+          },
+          { timeout: 30000 }
+        );
+
+        pageTitle = await page.title();
+        console.log(`✅ Passed Cloudflare! New Title: "${pageTitle}"`);
+      } catch (e) {
+        console.error("❌ Stuck on Cloudflare. Taking snapshot.");
+        throw new Error("Blocked by Cloudflare - IP Flagged.");
+      }
     }
 
     const editorSelector = ".monaco-editor";
@@ -234,10 +246,8 @@ async function solvePOTD() {
         "⚠️ Editor not found immediately. Scanning for 'Code' tab..."
       );
 
-      // Search ALL potential elements for "Code"
       const clicked = await page.evaluate(() => {
         const elements = [...document.querySelectorAll("div, span, button, p")];
-        // Find element that is exactly "Code"
         const codeTab = elements.find(
           (el) => el.innerText && el.innerText.trim() === "Code"
         );
@@ -253,17 +263,15 @@ async function solvePOTD() {
         await new Promise((r) => setTimeout(r, 2000));
         await page.waitForSelector(editorSelector, { timeout: 15000 });
       } else {
-        throw new Error("UI Mismatch: Could not find 'Code' tab on page.");
+        throw new Error("UI Mismatch: Could not find 'Code' tab.");
       }
     }
 
     await page.click(editorSelector);
-
     await page.keyboard.down("Control");
     await page.keyboard.press("A");
     await page.keyboard.up("Control");
     await page.keyboard.press("Backspace");
-
     await page.keyboard.sendCharacter(solutionCode);
     await new Promise((r) => setTimeout(r, 1000));
 
@@ -275,7 +283,7 @@ async function solvePOTD() {
 
     if (submitBtn) {
       await submitBtn.click();
-      console.log("Submitted! Waiting for network confirmation...");
+      console.log("Submitted! Waiting for confirmation...");
       await new Promise((r) => setTimeout(r, 5000));
       console.log("✅ Submission sequence complete.");
     } else {
@@ -310,16 +318,15 @@ app.get("/status", async (req, res) => {
 app.get("/trigger", async (req, res) => {
   if (isProcessing) return res.send("⚠️ Task is already running!");
   solvePOTD();
-  res.send("Task triggered. Check Render logs for progress.");
+  res.send("Task triggered. Check Render logs.");
 });
 
 app.post("/update-creds", (req, res) => {
   USER_COOKIES.LEETCODE_SESSION = req.body.session;
   USER_COOKIES.csrftoken = req.body.csrf;
-  res.send("Credentials updated! <a href='/status'>Check Status</a>");
+  res.send("Credentials updated!");
 });
 
-// Schedule: 6:00 AM IST
 cron.schedule("0 6 * * *", () => solvePOTD(), { timezone: "Asia/Kolkata" });
 
 const PORT = process.env.PORT || 10000;

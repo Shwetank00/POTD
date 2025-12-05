@@ -21,21 +21,46 @@ let USER_COOKIES = {
   csrftoken: process.env.CSRF_TOKEN || "",
 };
 
-// --- 1. SESSION VALIDATOR ---
+// --- HUMAN HELPER FUNCTIONS (The Magic) ---
+
+// 1. Sleep for a random amount of time (e.g., between 2 and 5 seconds)
+const randomDelay = (min = 1000, max = 3000) =>
+  new Promise((resolve) =>
+    setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min)
+  );
+
+// 2. Type like a human (variable speed)
+async function humanType(page, selector, text) {
+  await page.click(selector);
+  for (const char of text) {
+    await page.keyboard.sendCharacter(char);
+    // Random delay between 50ms and 150ms per key
+    await new Promise((r) => setTimeout(r, Math.random() * 100 + 50));
+  }
+}
+
+// 3. Move mouse naturally and click
+async function humanClick(page, selector) {
+  const element = await page.$(selector);
+  if (!element) throw new Error(`Element ${selector} not found`);
+
+  const box = await element.boundingBox();
+  const x = box.x + box.width / 2 + (Math.random() * 10 - 5); // Add jitter
+  const y = box.y + box.height / 2 + (Math.random() * 10 - 5);
+
+  // Move in steps to look real
+  await page.mouse.move(x, y, { steps: 25 });
+  await randomDelay(200, 600);
+  await page.mouse.click(x, y);
+}
+
+// --- STANDARD FUNCTIONS ---
+
 async function validateSession() {
   try {
     const response = await axios.post(
       "https://leetcode.com/graphql",
-      {
-        query: `
-                    query globalData {
-                        userStatus {
-                            isSignedIn
-                            username
-                        }
-                    }
-                `,
-      },
+      { query: `query globalData { userStatus { isSignedIn username } }` },
       {
         headers: {
           Cookie: `LEETCODE_SESSION=${USER_COOKIES.LEETCODE_SESSION}; csrftoken=${USER_COOKIES.csrftoken}`,
@@ -44,63 +69,40 @@ async function validateSession() {
         },
       }
     );
-
     const status = response.data.data.userStatus;
-    if (status && status.isSignedIn) {
+    if (status && status.isSignedIn)
       return { valid: true, username: status.username };
-    }
     return { valid: false };
   } catch (e) {
-    console.error("Session Validation Error:", e.message);
     return { valid: false, error: e.message };
   }
 }
 
-// --- 2. UNIVERSAL SOLUTION FETCHER ---
 async function getSolution(id, titleSlug) {
   try {
     const pathByID = path.join(__dirname, "solutions", `${id}.txt`);
     if (fs.existsSync(pathByID)) return fs.readFileSync(pathByID, "utf8");
-
     const pathByName = path.join(__dirname, "solutions", `${titleSlug}.cpp`);
     if (fs.existsSync(pathByName)) return fs.readFileSync(pathByName, "utf8");
-
-    console.log(
-      `🌐 Local file not found. Fetching from GitHub for: ${titleSlug}...`
-    );
+    console.log(`🌐 Fetching from GitHub: ${titleSlug}...`);
     const githubUrl = `https://raw.githubusercontent.com/kamyu104/LeetCode-Solutions/master/C++/${titleSlug}.cpp`;
     const response = await axios.get(githubUrl);
-
-    if (response.status === 200 && response.data) {
+    if (response.status === 200 && response.data)
       return response.data
         .replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, "$1")
         .trim();
-    }
   } catch (e) {
-    console.error(`❌ Failed to fetch solution for ${titleSlug}:`, e.message);
+    console.error(`❌ GitHub Fetch Failed:`, e.message);
   }
   return null;
 }
 
-// --- 3. FETCH POTD ---
 async function getDailyProblem() {
   try {
     const response = await axios.post(
       "https://leetcode.com/graphql",
       {
-        query: `
-                    query questionOfToday {
-                        activeDailyCodingChallengeQuestion {
-                            date
-                            userStatus
-                            link
-                            question {
-                                questionFrontendId
-                                titleSlug
-                            }
-                        }
-                    }
-                `,
+        query: `query questionOfToday { activeDailyCodingChallengeQuestion { date userStatus link question { questionFrontendId titleSlug } } }`,
       },
       {
         headers: {
@@ -117,18 +119,15 @@ async function getDailyProblem() {
   }
 }
 
-// --- 4. AUTOMATION LOGIC ---
+// --- 4. MAIN LOGIC (UPDATED) ---
 async function solvePOTD() {
-  if (isProcessing) {
-    console.log("⚠️ Task already running. Skipping.");
-    return;
-  }
+  if (isProcessing) return;
   isProcessing = true;
-  console.log(`[${new Date().toISOString()}] --- Starting Task ---`);
+  console.log(`[${new Date().toISOString()}] --- Starting Human-Like Task ---`);
 
   const session = await validateSession();
   if (!session.valid) {
-    console.log("❌ ERROR: Credentials are invalid or expired.");
+    console.log("❌ ERROR: Credentials invalid.");
     isProcessing = false;
     return;
   }
@@ -162,31 +161,16 @@ async function solvePOTD() {
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--no-first-run",
-        "--no-zygote",
         "--single-process",
-        "--disable-extensions",
-        "--mute-audio",
       ],
     });
 
     const page = await browser.newPage();
-
-    // Use a realistic User Agent
+    // High-res screen looks more human
+    await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
-
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      if (
-        ["image", "stylesheet", "font", "media"].includes(req.resourceType())
-      ) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
 
     await page.setCookie(
       {
@@ -201,96 +185,120 @@ async function solvePOTD() {
       }
     );
 
+    // 1. Visit Homepage First
+    console.log("🌍 Visiting Homepage...");
+    await page.goto("https://leetcode.com/", { waitUntil: "domcontentloaded" });
+    await randomDelay(2000, 4000);
+
+    // 2. Go to Problem
+    console.log(`➡️ Navigating to Problem...`);
     await page.goto(`https://leetcode.com/problems/${titleSlug}/`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    // --- NEW CLOUDFLARE HANDLER ---
+    // --- CLOUDFLARE HANDLER (WITH HUMAN MOUSE) ---
     let pageTitle = await page.title();
-    console.log(`📄 Page Title: "${pageTitle}"`);
-
     if (
       pageTitle.includes("Just a moment") ||
       pageTitle.includes("Security Check")
     ) {
-      console.log(
-        "⚠️ Cloudflare Challenge detected. Waiting for redirect (max 30s)..."
-      );
-
+      console.log("⚠️ Cloudflare detected. Engaging human behavior...");
       try {
-        // Wait for the title to change to something else
+        await randomDelay(3000, 5000);
+
+        // Jiggle mouse to show life
+        await page.mouse.move(100, 100);
+        await page.mouse.move(200, 200, { steps: 20 });
+
+        // Find iframe and click box
+        const frames = page.frames();
+        const challengeFrame = frames.find(
+          (f) => f.url().includes("cloudflare") || f.url().includes("challenge")
+        );
+
+        if (challengeFrame) {
+          const checkbox = await challengeFrame.$('input[type="checkbox"]');
+          if (checkbox) {
+            const box = await checkbox.boundingBox();
+            const x = box.x + box.width / 2;
+            const y = box.y + box.height / 2;
+            console.log("🖱️ Clicking Cloudflare Checkbox...");
+            await page.mouse.move(x, y, { steps: 50 }); // Slow move
+            await randomDelay(200, 500);
+            await page.mouse.click(x, y);
+          }
+        }
+
         await page.waitForFunction(
-          () => {
-            const t = document.title;
-            return (
-              !t.includes("Just a moment") && !t.includes("Security Check")
-            );
-          },
+          () => !document.title.includes("Just a moment"),
           { timeout: 30000 }
         );
-
-        pageTitle = await page.title();
-        console.log(`✅ Passed Cloudflare! New Title: "${pageTitle}"`);
+        console.log("✅ Passed Cloudflare!");
       } catch (e) {
-        console.error("❌ Stuck on Cloudflare. Taking snapshot.");
-        throw new Error("Blocked by Cloudflare - IP Flagged.");
+        console.error("❌ Cloudflare blocked us.");
+        throw new Error("Cloudflare Block");
       }
     }
 
+    // 3. Simulate "Reading" the question
+    console.log("📖 Reading question...");
     const editorSelector = ".monaco-editor";
     try {
-      await page.waitForSelector(editorSelector, { timeout: 10000 });
+      await page.waitForSelector(editorSelector, { timeout: 15000 });
     } catch (e) {
-      console.log(
-        "⚠️ Editor not found immediately. Scanning for 'Code' tab..."
-      );
-
-      const clicked = await page.evaluate(() => {
-        const elements = [...document.querySelectorAll("div, span, button, p")];
-        const codeTab = elements.find(
-          (el) => el.innerText && el.innerText.trim() === "Code"
-        );
-        if (codeTab) {
-          codeTab.click();
-          return true;
+      // Click Code tab if needed
+      const divs = await page.$$("div");
+      for (const div of divs) {
+        const text = await page.evaluate((el) => el.innerText, div);
+        if (text === "Code") {
+          await humanClick(page, "div"); // Click like a human
+          break;
         }
-        return false;
-      });
-
-      if (clicked) {
-        console.log("✅ Clicked 'Code' tab. Waiting for editor...");
-        await new Promise((r) => setTimeout(r, 2000));
-        await page.waitForSelector(editorSelector, { timeout: 15000 });
-      } else {
-        throw new Error("UI Mismatch: Could not find 'Code' tab.");
       }
+      await page.waitForSelector(editorSelector, { timeout: 10000 });
     }
 
+    // 4. Type Solution
+    console.log("✍️ Typing solution...");
     await page.click(editorSelector);
     await page.keyboard.down("Control");
     await page.keyboard.press("A");
     await page.keyboard.up("Control");
     await page.keyboard.press("Backspace");
-    await page.keyboard.sendCharacter(solutionCode);
-    await new Promise((r) => setTimeout(r, 1000));
 
-    const submitBtn = await page.evaluateHandle(() => {
-      return Array.from(document.querySelectorAll("button")).find((b) =>
+    // This actually types it character by character now
+    await humanType(page, ".monaco-editor textarea", solutionCode);
+
+    await randomDelay(1000, 3000); // Hesitate before submitting
+
+    // 5. Submit
+    const submitBtn = await page.evaluateHandle(() =>
+      Array.from(document.querySelectorAll("button")).find((b) =>
         b.innerText.includes("Submit")
-      );
-    });
-
+      )
+    );
     if (submitBtn) {
-      await submitBtn.click();
-      console.log("Submitted! Waiting for confirmation...");
+      const btnBox = await submitBtn.boundingBox();
+      if (btnBox) {
+        await page.mouse.move(btnBox.x + 10, btnBox.y + 10, { steps: 20 });
+        await randomDelay(500, 1000);
+        await page.mouse.down();
+        await randomDelay(50, 150);
+        await page.mouse.up();
+        console.log("✅ Clicked Submit.");
+      } else {
+        await submitBtn.click(); // Fallback
+      }
+
+      console.log("Submitted! Waiting...");
       await new Promise((r) => setTimeout(r, 5000));
-      console.log("✅ Submission sequence complete.");
+      console.log("✅ Complete.");
     } else {
-      console.error("❌ Submit button not found.");
+      console.error("❌ Submit button missing.");
     }
   } catch (e) {
-    console.error("❌ Automation Error:", e.message);
+    console.error("❌ Error:", e.message);
   } finally {
     if (browser) await browser.close();
     isProcessing = false;
@@ -301,26 +309,15 @@ async function solvePOTD() {
 
 // --- ROUTES ---
 app.get("/ping", (req, res) => res.status(200).send("Pong!"));
-
 app.get("/status", async (req, res) => {
   const session = await validateSession();
-  if (session.valid) {
-    res.send(
-      `✅ <strong>ONLINE</strong><br>Logged in as: <b>${session.username}</b>`
-    );
-  } else {
-    res.send(
-      `❌ <strong>OFFLINE</strong><br>Credentials invalid or expired.<br><br><a href="/">Update Credentials</a>`
-    );
-  }
+  res.send(session.valid ? `✅ ONLINE: ${session.username}` : `❌ OFFLINE`);
 });
-
 app.get("/trigger", async (req, res) => {
   if (isProcessing) return res.send("⚠️ Task is already running!");
   solvePOTD();
-  res.send("Task triggered. Check Render logs.");
+  res.send("Task triggered. Check Logs.");
 });
-
 app.post("/update-creds", (req, res) => {
   USER_COOKIES.LEETCODE_SESSION = req.body.session;
   USER_COOKIES.csrftoken = req.body.csrf;

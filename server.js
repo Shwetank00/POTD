@@ -23,29 +23,42 @@ let USER_COOKIES = {
 
 // --- 1. MEMORY OPTIMIZED SOLUTION LOADER ---
 // Instead of keeping the huge object in memory, we load, extract, and dump it.
-function getSolutionForID(id) {
+// --- 1. SMART SOLUTION FETCHER (Local -> GitHub) ---
+async function getSolution(id, titleSlug) {
   try {
-    if (!fs.existsSync("./solutions.js")) return null;
-
-    // Read file
-    const code = fs.readFileSync("./solutions.js", "utf8");
-
-    // Create a temporary sandbox
-    const sandbox = {};
-    vm.createContext(sandbox);
-
-    // Run code to populate the object
-    vm.runInContext(code + ";", sandbox);
-
-    // Extract ONLY the specific solution we need
-    if (sandbox.LEETCODE_SOLUTIONS && sandbox.LEETCODE_SOLUTIONS[id]) {
-      return sandbox.LEETCODE_SOLUTIONS[id];
+    // STEP 1: Check Local File (solutions/ID.txt)
+    const localPath = path.join(__dirname, "solutions", `${id}.txt`);
+    if (fs.existsSync(localPath)) {
+      console.log(`📂 Found local solution for ID: ${id}`);
+      return fs.readFileSync(localPath, "utf8");
     }
-    return null;
+
+    // STEP 2: Fetch from GitHub (kamyu104/LeetCode-Solutions)
+    // Kamyu uses the exact title-slug for filenames, which is perfect for us.
+    console.log(
+      `🌐 Local file not found. Fetching from GitHub for: ${titleSlug}...`
+    );
+
+    const githubUrl = `https://raw.githubusercontent.com/kamyu104/LeetCode-Solutions/master/C++/${titleSlug}.cpp`;
+
+    const response = await axios.get(githubUrl);
+
+    if (response.status === 200 && response.data) {
+      let code = response.data;
+
+      // Clean up the code (remove comments to save space/time)
+      // This regex removes block comments /* ... */ and line comments // ...
+      code = code.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, "$1").trim();
+
+      // Optional: Save it locally so we don't need to fetch it next time
+      // fs.writeFileSync(localPath, code);
+
+      return code;
+    }
   } catch (e) {
-    console.error("Error reading solution:", e.message);
-    return null;
+    console.error(`❌ Failed to fetch solution for ${titleSlug}:`, e.message);
   }
+  return null;
 }
 
 // --- 2. FETCH POTD ---
@@ -116,7 +129,8 @@ async function solvePOTD() {
     const { questionFrontendId, titleSlug } = dailyData.question;
 
     // 4. Get Solution (Load -> Extract -> Release Memory)
-    const solutionCode = getSolutionForID(questionFrontendId);
+    // We now pass both ID and TitleSlug
+    const solutionCode = await getSolution(questionFrontendId, titleSlug);
     if (!solutionCode) {
       console.log(`❌ No solution found for ID: ${questionFrontendId}`);
       return;

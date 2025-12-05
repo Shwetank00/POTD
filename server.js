@@ -21,7 +21,7 @@ let USER_COOKIES = {
   csrftoken: process.env.CSRF_TOKEN || "",
 };
 
-// --- 1. SESSION VALIDATOR (NEW) ---
+// --- 1. SESSION VALIDATOR ---
 async function validateSession() {
   try {
     const response = await axios.post(
@@ -131,7 +131,6 @@ async function solvePOTD() {
   isProcessing = true;
   console.log(`[${new Date().toISOString()}] --- Starting Task ---`);
 
-  // STEP A: Validate Session First
   const session = await validateSession();
   if (!session.valid) {
     console.log(
@@ -213,14 +212,32 @@ async function solvePOTD() {
     try {
       await page.waitForSelector(editorSelector, { timeout: 15000 });
     } catch (e) {
-      console.log("Checking for Code tab...");
-      const codeTab = await page.evaluateHandle(() => {
-        return Array.from(document.querySelectorAll("div")).find(
-          (el) => el.innerText === "Code"
-        );
+      console.log("⚠️ Editor not found immediately. Looking for 'Code' tab...");
+
+      // --- FIX START: ROBUST CLICK LOGIC ---
+      const clicked = await page.evaluate(() => {
+        const divs = Array.from(document.querySelectorAll("div"));
+        // Find a div that strictly contains the text "Code"
+        const codeTab = divs.find((el) => el.innerText.trim() === "Code");
+        if (codeTab) {
+          codeTab.click();
+          return true;
+        }
+        return false;
       });
-      if (codeTab) await codeTab.click();
-      await page.waitForSelector(editorSelector, { timeout: 15000 });
+
+      if (clicked) {
+        console.log("✅ Clicked 'Code' tab. Waiting for editor...");
+        await new Promise((r) => setTimeout(r, 2000));
+        await page.waitForSelector(editorSelector, { timeout: 15000 });
+      } else {
+        console.log(
+          "❌ Could not find 'Code' tab. Taking snapshot and aborting."
+        );
+        // If we really can't find it, we stop here to avoid crashing
+        throw new Error("UI Mismatch: Cannot find Editor or Code tab.");
+      }
+      // --- FIX END ---
     }
 
     await page.click(editorSelector);
@@ -260,7 +277,6 @@ async function solvePOTD() {
 // --- ROUTES ---
 app.get("/ping", (req, res) => res.status(200).send("Pong!"));
 
-// NEW: Status Check Endpoint
 app.get("/status", async (req, res) => {
   const session = await validateSession();
   if (session.valid) {

@@ -56,33 +56,39 @@ async function validateSession() {
   }
 }
 
-// --- 2. SMART SOLUTION FETCHER ---
+// --- 2. UNIVERSAL SOLUTION FETCHER ---
 async function getSolution(id, titleSlug) {
   try {
-    // Check Local
-    const localPath = path.join(__dirname, "solutions", `${id}.txt`);
-    if (fs.existsSync(localPath)) {
-      console.log(`📂 Found local solution for ID: ${id}`);
-      return fs.readFileSync(localPath, "utf8");
+    // STRATEGY 1: Check for "ID.txt" (Old format)
+    const pathByID = path.join(__dirname, "solutions", `${id}.txt`);
+    if (fs.existsSync(pathByID)) {
+      console.log(`📂 Found local solution (ID): ${id}.txt`);
+      return fs.readFileSync(pathByID, "utf8");
     }
 
-    // Check GitHub
+    // STRATEGY 2: Check for "title-slug.cpp" (GitHub Repo format)
+    // This lets you drop files from kamyu104 directly into your folder!
+    const pathByName = path.join(__dirname, "solutions", `${titleSlug}.cpp`);
+    if (fs.existsSync(pathByName)) {
+      console.log(`📂 Found local solution (Name): ${titleSlug}.cpp`);
+      return fs.readFileSync(pathByName, "utf8");
+    }
+
+    // STRATEGY 3: Fetch from GitHub Online (Fallback)
     console.log(
       `🌐 Local file not found. Fetching from GitHub for: ${titleSlug}...`
     );
     const githubUrl = `https://raw.githubusercontent.com/kamyu104/LeetCode-Solutions/master/C++/${titleSlug}.cpp`;
-    const response = await axios.get(githubUrl);
 
+    const response = await axios.get(githubUrl);
     if (response.status === 200 && response.data) {
       let code = response.data;
+      // Remove comments to save space
       code = code.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, "$1").trim();
       return code;
     }
   } catch (e) {
-    console.error(
-      `❌ Failed to fetch solution for ${titleSlug} (GitHub):`,
-      e.message
-    );
+    console.error(`❌ Failed to fetch solution for ${titleSlug}:`, e.message);
   }
   return null;
 }
@@ -203,22 +209,38 @@ async function solvePOTD() {
       }
     );
 
+    // Navigate with explicit wait for domcontentloaded
     await page.goto(`https://leetcode.com/problems/${titleSlug}/`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
+    // Log Title for Debugging
+    const pageTitle = await page.title();
+    console.log(`📄 Page Title Loaded: "${pageTitle}"`);
+
+    if (
+      pageTitle.includes("Just a moment") ||
+      pageTitle.includes("Security Check")
+    ) {
+      throw new Error("Blocked by Cloudflare (Page Title: " + pageTitle + ")");
+    }
+
     const editorSelector = ".monaco-editor";
     try {
-      await page.waitForSelector(editorSelector, { timeout: 15000 });
+      await page.waitForSelector(editorSelector, { timeout: 10000 });
     } catch (e) {
-      console.log("⚠️ Editor not found immediately. Looking for 'Code' tab...");
+      console.log(
+        "⚠️ Editor not found immediately. Scanning for 'Code' tab..."
+      );
 
-      // --- FIX START: ROBUST CLICK LOGIC ---
+      // Search ALL potential elements for "Code"
       const clicked = await page.evaluate(() => {
-        const divs = Array.from(document.querySelectorAll("div"));
-        // Find a div that strictly contains the text "Code"
-        const codeTab = divs.find((el) => el.innerText.trim() === "Code");
+        const elements = [...document.querySelectorAll("div, span, button, p")];
+        // Find element that is exactly "Code"
+        const codeTab = elements.find(
+          (el) => el.innerText && el.innerText.trim() === "Code"
+        );
         if (codeTab) {
           codeTab.click();
           return true;
@@ -231,13 +253,8 @@ async function solvePOTD() {
         await new Promise((r) => setTimeout(r, 2000));
         await page.waitForSelector(editorSelector, { timeout: 15000 });
       } else {
-        console.log(
-          "❌ Could not find 'Code' tab. Taking snapshot and aborting."
-        );
-        // If we really can't find it, we stop here to avoid crashing
-        throw new Error("UI Mismatch: Cannot find Editor or Code tab.");
+        throw new Error("UI Mismatch: Could not find 'Code' tab on page.");
       }
-      // --- FIX END ---
     }
 
     await page.click(editorSelector);

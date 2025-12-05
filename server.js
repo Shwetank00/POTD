@@ -1,5 +1,4 @@
 require("dotenv").config();
-
 const express = require("express");
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
@@ -13,30 +12,43 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
-// Increase payload size limit just in case
-app.use(express.json({ limit: "50mb" }));
 app.use(express.static("public"));
 
-// --- 1. Load solutions safely ---
-function loadSolutions() {
-  try {
-    if (!fs.existsSync("./solutions.js")) return {};
-    const code = fs.readFileSync("./solutions.js", "utf8");
-    const sandbox = {};
-    vm.createContext(sandbox);
-    return vm.runInContext(code + "; LEETCODE_SOLUTIONS;", sandbox);
-  } catch (e) {
-    console.error("Error loading solutions:", e.message);
-    return {};
-  }
-}
-
+// --- GLOBAL STATE ---
+let isProcessing = false; // LOCK: Prevents double execution
 let USER_COOKIES = {
   LEETCODE_SESSION: process.env.LEETCODE_SESSION || "",
   csrftoken: process.env.CSRF_TOKEN || "",
 };
 
-// --- 2. Helper to fetch POTD ---
+// --- 1. MEMORY OPTIMIZED SOLUTION LOADER ---
+// Instead of keeping the huge object in memory, we load, extract, and dump it.
+function getSolutionForID(id) {
+  try {
+    if (!fs.existsSync("./solutions.js")) return null;
+
+    // Read file
+    const code = fs.readFileSync("./solutions.js", "utf8");
+
+    // Create a temporary sandbox
+    const sandbox = {};
+    vm.createContext(sandbox);
+
+    // Run code to populate the object
+    vm.runInContext(code + ";", sandbox);
+
+    // Extract ONLY the specific solution we need
+    if (sandbox.LEETCODE_SOLUTIONS && sandbox.LEETCODE_SOLUTIONS[id]) {
+      return sandbox.LEETCODE_SOLUTIONS[id];
+    }
+    return null;
+  } catch (e) {
+    console.error("Error reading solution:", e.message);
+    return null;
+  }
+}
+
+// --- 2. FETCH POTD ---
 async function getDailyProblem() {
   try {
     const response = await axios.post(
@@ -71,61 +83,76 @@ async function getDailyProblem() {
   }
 }
 
-// --- 3. Main Automation Logic ---
+// --- 3. OPTIMIZED AUTOMATION LOGIC ---
 async function solvePOTD() {
-  console.log("--- Starting Daily Submission Task ---");
-  const currentSolutions = loadSolutions();
+  // 1. Check Lock
+  if (isProcessing) {
+    console.log("⚠️ Task already running. Skipping duplicate trigger.");
+    return;
+  }
+  isProcessing = true; // Lock
 
+  console.log(`[${new Date().toISOString()}] --- Starting Task ---`);
+
+  // 2. Validate Cookies
   if (!USER_COOKIES.LEETCODE_SESSION || !USER_COOKIES.csrftoken) {
-    console.log("Error: No credentials found.");
+    console.log("❌ No credentials found.");
+    isProcessing = false;
     return;
   }
 
-  const dailyData = await getDailyProblem();
-  if (!dailyData) return;
-
-  if (dailyData.userStatus === "Finish") {
-    console.log(
-      `[SKIP] Today's problem (${dailyData.question.titleSlug}) is already finished.`
-    );
-    return;
-  }
-
-  const { questionFrontendId, titleSlug } = dailyData.question;
-  const solutionCode = currentSolutions[questionFrontendId];
-
-  if (!solutionCode) {
-    console.log(`[FAIL] No solution found for ID: ${questionFrontendId}`);
-    return;
-  }
-
-  console.log(`Solving POTD: ${titleSlug} (ID: ${questionFrontendId})`);
-
-  // Launch Browser (Production / Docker Version)
-  const browser = await puppeteer.launch({
-    headless: "new", // Run in background (no window)
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--single-process", // Crucial for Docker
-    ],
-  });
-
-  // // Launch Browser (Windows / Local Friendly Version)
-  // const browser = await puppeteer.launch({
-  //   // Set to 'false' so you can SEE the browser working!
-  //   // Set to 'true' or '"new"' if you want it hidden.
-  //   headless: false,
-  //   args: [
-  //     "--start-maximized", // Opens browser in full width
-  //     // We REMOVED '--single-process' and '--no-sandbox' which cause crashes on Windows
-  //   ],
-  //   defaultViewport: null, // Allows the website to fill the window
-  // });
+  let browser = null;
 
   try {
+    // 3. Get Problem
+    const dailyData = await getDailyProblem();
+    if (!dailyData) throw new Error("Could not fetch daily problem");
+
+    if (dailyData.userStatus === "Finish") {
+      console.log(`✅ Already Solved: ${dailyData.question.titleSlug}`);
+      return; // Cleanup in finally block
+    }
+
+    const { questionFrontendId, titleSlug } = dailyData.question;
+
+    // 4. Get Solution (Load -> Extract -> Release Memory)
+    const solutionCode = getSolutionForID(questionFrontendId);
+    if (!solutionCode) {
+      console.log(`❌ No solution found for ID: ${questionFrontendId}`);
+      return;
+    }
+
+    console.log(`🚀 Solving: ${titleSlug} (ID: ${questionFrontendId})`);
+
+    // 5. Launch Minimal Browser
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", // Uses disk instead of RAM for temp files
+        "--disable-gpu", // Saves huge RAM
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process", // Required for Render
+        "--disable-extensions",
+        "--mute-audio",
+      ],
+    });
+
     const page = await browser.newPage();
+
+    // --- CRITICAL: BLOCK IMAGES & FONTS (Saves ~100MB) ---
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      if (
+        ["image", "stylesheet", "font", "media"].includes(req.resourceType())
+      ) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
 
     // Authenticate
     await page.setCookie(
@@ -142,140 +169,95 @@ async function solvePOTD() {
     );
 
     // Navigate
-    console.log("Navigating to problem page...");
     await page.goto(`https://leetcode.com/problems/${titleSlug}/`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    // LOGGING PAGE TITLE (Helps debug Cloudflare blocks)
-    const pageTitle = await page.title();
-    console.log(`Page Title loaded: "${pageTitle}"`);
-
-    // WAIT STRATEGY: Try waiting for the editor OR the Code tab
+    // Find Editor
     console.log("Waiting for editor...");
+    const editorSelector = ".monaco-editor";
 
+    // Try fallback for "Code" tab if editor isn't visible immediately
     try {
-      // Try waiting for the specific editor class
-      await page.waitForSelector(".monaco-editor", { timeout: 20000 });
+      await page.waitForSelector(editorSelector, { timeout: 15000 });
     } catch (e) {
-      console.log(
-        "Standard editor selector failed. Trying to click 'Code' tab..."
-      );
-      // New UI Fallback: Sometimes we need to click the "Code" tab
-      // This is a generic attempt to find a tab that looks like "Code"
+      console.log("Editor not found immediately, checking tabs...");
       const codeTab = await page.evaluateHandle(() => {
-        const divs = Array.from(document.querySelectorAll("div"));
-        return divs.find((el) => el.innerText === "Code");
+        return Array.from(document.querySelectorAll("div")).find(
+          (el) => el.innerText === "Code"
+        );
       });
-      if (codeTab) {
-        await codeTab.click();
-        await new Promise((r) => setTimeout(r, 2000)); // Wait for tab switch
-      }
+      if (codeTab) await codeTab.click();
+      await page.waitForSelector(editorSelector, { timeout: 15000 });
     }
 
-    // Final attempt to find editor after potential tab switch
-    await page.click(".monaco-editor"); // This will throw error if still not found
+    // Type Solution
+    await page.click(editorSelector);
 
-    // Typing logic
-    console.log("Editor found. Typing solution...");
+    // Mac/Windows compatible clear
     await page.keyboard.down("Control");
     await page.keyboard.press("A");
     await page.keyboard.up("Control");
     await page.keyboard.press("Backspace");
+
     await page.keyboard.sendCharacter(solutionCode);
+    await new Promise((r) => setTimeout(r, 1000));
 
-    await new Promise((r) => setTimeout(r, 2000));
-
-    console.log("Clicking Submit...");
+    // Submit
     const submitBtn = await page.evaluateHandle(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      return buttons.find((b) => b.innerText.includes("Submit"));
+      return Array.from(document.querySelectorAll("button")).find((b) =>
+        b.innerText.includes("Submit")
+      );
     });
 
     if (submitBtn) {
       await submitBtn.click();
-      console.log("Submitted! Waiting for network response...");
-      await page
-        .waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 })
-        .catch((e) =>
-          console.log(
-            "Navigation timeout (might be OK if submission recorded)."
-          )
-        );
+      console.log("Submitted! Waiting for network confirmation...");
+      // Wait briefly for network activity to settle, don't wait for full page reload to save RAM
+      await new Promise((r) => setTimeout(r, 5000));
+      console.log("✅ Submission sequence complete.");
     } else {
-      console.error("Submit button not found.");
+      console.error("❌ Submit button not found.");
     }
   } catch (e) {
-    console.error("Automation failed:", e.message);
+    console.error("❌ Automation Error:", e.message);
   } finally {
-    await browser.close();
+    // 6. AGGRESSIVE CLEANUP
+    if (browser) await browser.close();
+    isProcessing = false; // Unlock
+    if (global.gc) global.gc(); // Force Garbage Collection if exposed
+    console.log(
+      `[${new Date().toISOString()}] Task Finished. Memory released.`
+    );
   }
 }
 
-// --- 4. DEBUG ROUTE (THE FIX) ---
-// Visit /debug to see exactly what the bot sees
-app.get("/debug", async (req, res) => {
-  console.log("Debug Screenshot triggered...");
+// --- ROUTES ---
 
-  if (!USER_COOKIES.LEETCODE_SESSION)
-    return res.send("Error: Set Environment Variables first.");
+app.get("/ping", (req, res) => res.status(200).send("Pong!"));
 
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--window-size=1280,800",
-    ],
-  });
+app.get("/trigger", async (req, res) => {
+  if (isProcessing) return res.send("⚠️ Task is already running! Check logs.");
 
-  try {
-    const page = await browser.newPage();
-    await page.setCookie(
-      {
-        name: "LEETCODE_SESSION",
-        value: USER_COOKIES.LEETCODE_SESSION,
-        domain: ".leetcode.com",
-      },
-      {
-        name: "csrftoken",
-        value: USER_COOKIES.csrftoken,
-        domain: ".leetcode.com",
-      }
-    );
-
-    // Go to a known problem (Two Sum) to test access
-    await page.goto("https://leetcode.com/problems/two-sum/", {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    });
-
-    // Capture Screenshot
-    const screenshot = await page.screenshot();
-
-    res.set("Content-Type", "image/png");
-    res.send(screenshot);
-  } catch (e) {
-    res.send("Debug failed: " + e.message);
-  } finally {
-    await browser.close();
-  }
+  // Run in background, don't keep HTTP request waiting
+  solvePOTD();
+  res.send("Task triggered in background. Check Render logs.");
 });
 
-// Routes
-app.get("/ping", (req, res) => res.status(200).send("Pong!"));
 app.post("/update-creds", (req, res) => {
   USER_COOKIES.LEETCODE_SESSION = req.body.session;
   USER_COOKIES.csrftoken = req.body.csrf;
-  res.send("Updated!");
+  res.send("Credentials updated!");
 });
-app.get("/trigger", async (req, res) => {
-  solvePOTD();
-  res.send("Triggered. Check logs.");
+
+app.get("/debug", async (req, res) => {
+  // Simplified debug to save RAM
+  res.send("Debug screenshot disabled to save memory on free tier.");
 });
+
+// Schedule: 6:00 AM IST
 cron.schedule("0 6 * * *", () => solvePOTD(), { timezone: "Asia/Kolkata" });
 
-const PORT = process.env.PORT || 10000; // Render usually uses 10000
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
